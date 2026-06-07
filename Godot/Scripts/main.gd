@@ -1,5 +1,41 @@
 extends Control
 
+# Intercepts ResourceLoader for PNG/WebP/JPG in user:// and returns ImageTexture.
+# spine-godot's C++ atlas loader does Ref<Texture2D>(res) which silently fails
+# when ResourceLoader returns Image for a raw PNG; this loader returns the correct type.
+class _UserImageLoader:
+	extends ResourceFormatLoader
+	# No type annotations — avoids StringName/String mismatch in GDVirtual dispatch.
+	func _get_recognized_extensions():
+		return PackedStringArray(["png", "webp", "jpg", "jpeg"])
+	func _get_resource_type(path):
+		return "ImageTexture"
+	func _handles_type(type_name):
+		return true  # filter by path inside _load instead
+	func _load(path, _orig, _threads, _cache):
+		var p := str(path)
+		if not p.begins_with("user://"):
+			return ERR_UNAVAILABLE
+		var f := FileAccess.open(p, FileAccess.READ)
+		if f == null:
+			return ERR_CANT_OPEN
+		var bytes := f.get_buffer(f.get_length())
+		f.close()
+		var img := Image.new()
+		var err: int
+		if p.ends_with(".png"):
+			err = img.load_png_from_buffer(bytes)
+		elif p.ends_with(".webp"):
+			err = img.load_webp_from_buffer(bytes)
+		elif p.ends_with(".jpg") or p.ends_with(".jpeg"):
+			err = img.load_jpg_from_buffer(bytes)
+		else:
+			return ERR_FILE_UNRECOGNIZED
+		if err != OK:
+			return err
+		return ImageTexture.create_from_image(img)
+
+
 # ── Config ─────────────────────────────────────────────────────────────────
 const USER_DIR     := "user://spine/"
 const DEMO_DIR     := "res://assets/spine/demo/"
@@ -7,6 +43,7 @@ const BAR_H        := 64
 const DEFAULT_SCALE := 1.0
 
 # ── State ───────────────────────────────────────────────────────────────────
+var _user_img_loader: ResourceFormatLoader  # keep ref alive
 var spine_node: Node
 var looping    := true
 var view_scale := DEFAULT_SCALE
@@ -29,8 +66,12 @@ var reset_btn:  Button
 
 
 func _ready() -> void:
+	_user_img_loader = _UserImageLoader.new()
+	ResourceLoader.add_resource_format_loader(_user_img_loader, true)
+
 	set_anchors_and_offsets_preset(PRESET_FULL_RECT)
 	_build_ui()
+	set_process(false)
 
 	if OS.has_feature("web"):
 		_set_status("Selecione os arquivos Spine para começar")
@@ -82,7 +123,7 @@ func _build_ui() -> void:
 	bar.add_child(hbox)
 
 	# Load button — only visible on web
-	load_btn = _btn("📂 Carregar Spine", hbox, _open_file_picker)
+	load_btn = _btn("Carregar Spine", hbox, _open_file_picker)
 	load_btn.custom_minimum_size = Vector2(160, 36)
 	load_btn.visible = OS.has_feature("web")
 
@@ -98,13 +139,13 @@ func _build_ui() -> void:
 
 	_sep(hbox)
 
-	play_btn  = _btn("▶",  hbox, _on_play)
-	pause_btn = _btn("⏸", hbox, _on_pause)
-	stop_btn  = _btn("⏹", hbox, _on_stop)
+	play_btn  = _btn("play",  hbox, _on_play)
+	pause_btn = _btn("pausa", hbox, _on_pause)
+	stop_btn  = _btn("para", hbox, _on_stop)
 
 	_sep(hbox)
 
-	loop_btn = _btn("🔁", hbox, _on_loop)
+	loop_btn = _btn("loop", hbox, _on_loop)
 
 	_sep(hbox)
 
@@ -135,7 +176,7 @@ func _build_ui() -> void:
 
 	_sep(hbox)
 
-	reset_btn = _btn("⟳ Reset", hbox, _reset_view)
+	reset_btn = _btn("Reset", hbox, _reset_view)
 	reset_btn.custom_minimum_size = Vector2(90, 36)
 
 	var spacer := Control.new()
@@ -173,11 +214,13 @@ func _sep(parent: Node) -> void:
 # ── Web file picker ───────────────────────────────────────────────────────────
 
 func _open_file_picker() -> void:
+	load_btn.disabled = true
 	_set_status("Aguardando seleção...")
 	JavaScriptBridge.eval("""
 		(function() {
 			window._spineReady = false;
 			window._spineFiles = null;
+			window._spineCancelled = false;
 
 			function toBase64(buf) {
 				var bytes = new Uint8Array(buf);
@@ -192,9 +235,20 @@ func _open_file_picker() -> void:
 			var input = document.createElement('input');
 			input.type = 'file';
 			input.multiple = true;
-			input.accept = '.spine-json,.skel,.atlas,.png,.webp';
+			input.accept = '.spine-json,.json,.skel,.atlas,.png,.webp';
+
+			var filesChosen = false;
+
+			input.addEventListener('cancel', function() {
+				// Delay to let onchange fire first — GTK portal fires cancel even
+				// after a successful selection, so only cancel if no files were picked.
+				setTimeout(function() {
+					if (!filesChosen) window._spineCancelled = true;
+				}, 200);
+			});
 
 			input.onchange = function(e) {
+				filesChosen = true;
 				var files = Array.from(e.target.files);
 				var result = {};
 				var pending = files.length;
@@ -207,6 +261,9 @@ func _open_file_picker() -> void:
 							window._spineReady = true;
 						}
 					};
+					reader.onerror = function() {
+						if (!window._spineReady) window._spineCancelled = true;
+					};
 					reader.readAsArrayBuffer(f);
 				});
 			};
@@ -217,9 +274,13 @@ func _open_file_picker() -> void:
 
 
 func _process(_dt: float) -> void:
-	if not OS.has_feature("web"):
+	if JavaScriptBridge.eval("window._spineCancelled === true"):
+		JavaScriptBridge.eval("window._spineCancelled = false;")
+		set_process(false)
+		load_btn.disabled = false
+		_set_status("Selecione os arquivos Spine para começar")
 		return
-	if not bool(JavaScriptBridge.eval("window._spineReady === true")):
+	if not JavaScriptBridge.eval("window._spineReady === true"):
 		return
 	set_process(false)
 
@@ -230,6 +291,7 @@ func _process(_dt: float) -> void:
 	if files is Dictionary:
 		_handle_web_files(files)
 	else:
+		load_btn.disabled = false
 		_set_status("Erro ao ler os arquivos")
 
 
@@ -242,19 +304,44 @@ func _handle_web_files(files: Dictionary) -> void:
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(USER_DIR))
 
 	for name in files:
-		var bytes: PackedByteArray = Marshalls.base64_to_raw(files[name])
-		var out := USER_DIR + name
+		var fname: String  = str(name)
+		var bytes: PackedByteArray = Marshalls.base64_to_raw(str(files[name]))
+		var lname: String = fname.to_lower()
+
+		# load_from_file only recognises .spine-json/.spjson as JSON; .json falls
+		# through to the binary parser, which produces garbage. Rename on write.
+		var save_name := fname
+		if lname.ends_with(".json") and not lname.ends_with(".spine-json"):
+			save_name = fname.get_basename() + ".spine-json"
+			lname = save_name.to_lower()
+
+		# Patch version so spine-cpp 4.3 accepts the file.
+		if lname.ends_with(".spine-json"):
+			var text := bytes.get_string_from_utf8()
+			var parsed = JSON.parse_string(text)
+			if parsed is Dictionary and parsed.has("skeleton"):
+				var info = parsed["skeleton"]
+				if info is Dictionary and info.has("spine"):
+					var ver: String = str(info["spine"])
+					var parts := ver.split(".")
+					var major := int(parts[0]) if parts.size() > 0 else 0
+					var minor := int(parts[1]) if parts.size() > 1 else 0
+					if not (major == 4 and minor == 3):
+						bytes = text.replace('"%s"' % ver, '"4.3.00"').to_utf8_buffer()
+
+		var out: String = USER_DIR + save_name
 		var f := FileAccess.open(out, FileAccess.WRITE)
 		if f:
 			f.store_buffer(bytes)
 			f.close()
-		var lname := name.to_lower()
-		if lname.ends_with(".spine-json") or lname.ends_with(".skel"):
-			skel_path = out
-		elif lname.ends_with(".atlas"):
-			atlas_path = out
+			if lname.ends_with(".spine-json") or lname.ends_with(".skel"):
+				skel_path = out
+			elif lname.ends_with(".atlas"):
+				atlas_path = out
+
 
 	if skel_path.is_empty() or atlas_path.is_empty():
+		load_btn.disabled = false
 		_set_status("❌ Selecione: .spine-json/.skel + .atlas + .png")
 		return
 
@@ -273,7 +360,7 @@ func _find_spine(dir: String) -> Dictionary:
 	for f in DirAccess.get_files_at(dir):
 		var lf := f.to_lower()
 		if lf.ends_with(".import"): continue
-		if lf.ends_with(".spine-json") or lf.ends_with(".skel"):
+		if lf.ends_with(".spine-json") or lf.ends_with(".skel") or lf.ends_with(".json"):
 			skel = dir + f
 		elif lf.ends_with(".atlas"):
 			atlas = dir + f
@@ -283,22 +370,47 @@ func _find_spine(dir: String) -> Dictionary:
 
 
 func _load_spine(skel_path: String, atlas_path: String) -> void:
-	_set_status("Carregando recursos Spine...")
+	_set_status("Carregando skeleton...")
 
-	var skel_res = ResourceLoader.load(skel_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	var skel_res = ClassDB.instantiate("SpineSkeletonFileResource")
 	if skel_res == null:
-		_set_status("❌ Não foi possível carregar: " + skel_path.get_file())
+		load_btn.disabled = false
+		_set_status("SpineGodot plugin não encontrado")
 		return
+	skel_res.call("load_from_file", skel_path)
 
-	var atlas_res = ResourceLoader.load(atlas_path, "", ResourceLoader.CACHE_MODE_IGNORE)
+	var af := FileAccess.open(atlas_path, FileAccess.READ)
+	if af == null:
+		load_btn.disabled = false
+		_set_status("Atlas: erro ao abrir arquivo")
+		return
+	var atlas_text := af.get_as_text()
+	af.close()
+
+	var tex_array := []
+	for line in atlas_text.split("\n"):
+		var s := line.strip_edges()
+		if s.ends_with(".png") or s.ends_with(".webp") or s.ends_with(".jpg"):
+			var tex_path := atlas_path.get_base_dir() + "/" + s
+			var tex = ResourceLoader.load(tex_path)
+			tex_array.append(tex)
+
+	var atlas_res = ClassDB.instantiate("SpineAtlasResource")
 	if atlas_res == null:
-		_set_status("❌ Não foi possível carregar: " + atlas_path.get_file())
+		load_btn.disabled = false
+		_set_status("SpineGodot plugin não encontrado")
 		return
 
-	var data_res = SpineSkeletonDataResource.new()
-	data_res.skeleton_file_res = skel_res
-	data_res.atlas_res         = atlas_res
-	data_res.default_mix       = 0.15
+	atlas_res.call("load_from_atlas_file", atlas_path, tex_array, [], [])
+
+	var data_res = ClassDB.instantiate("SpineSkeletonDataResource")
+	if data_res == null:
+		load_btn.disabled = false
+		_set_status("SpineGodot plugin não encontrado")
+		return
+	data_res.set("skeleton_file_res", skel_res)
+	data_res.set("atlas_res",         atlas_res)
+	data_res.set("default_mix",       0.15)
 
 	_setup_spine(data_res, skel_path.get_file().get_basename())
 
@@ -310,30 +422,47 @@ func _setup_spine(data_res, label: String) -> void:
 
 	hint_lbl.hide()
 
-	var sprite = SpineSprite.new()
-	sprite.skeleton_data_res = data_res
+	var sprite = ClassDB.instantiate("SpineSprite")
+	if sprite == null:
+		load_btn.disabled = false
+		_set_status("❌ SpineGodot plugin não encontrado")
+		return
+	sprite.set("skeleton_data_res", data_res)
 	add_child(sprite)
 	move_child(sprite, 1)
 	spine_node = sprite
+	spine_node.set("active", true)
 
 	_reset_view()
 	await get_tree().process_frame
+	await get_tree().process_frame
 
-	_populate_animations()
+	var ok := _populate_animations(label)
 	_set_controls(true)
-	_set_status("✓ " + label)
+	load_btn.disabled = false
+	if ok and anim_btn.item_count > 0:
+		_set_status("✓ " + label + " (%d anims)" % anim_btn.item_count)
 
 
-func _populate_animations() -> void:
-	if spine_node == null: return
+func _populate_animations(label: String = "") -> bool:
+	if spine_node == null: return false
 	anim_btn.clear()
 	var skeleton = spine_node.get_skeleton()
-	if skeleton == null: return
-	for anim in skeleton.get_data().get_animations():
+	if skeleton == null:
+		_set_status("Erro ao carregar skeleton — verifique versão Spine (runtime: 4.3)")
+		return false
+	var data = skeleton.get_data()
+	if data == null:
+		_set_status("❌ SkeletonData null")
+		return false
+	for anim in data.get_animations():
 		anim_btn.add_item(anim.get_name())
-	if anim_btn.item_count > 0:
-		anim_btn.select(0)
-		_play_current()
+	if anim_btn.item_count == 0:
+		_set_status("⚠ Skeleton OK mas sem animações")
+		return false
+	anim_btn.select(0)
+	_play_current()
+	return true
 
 
 # ── View ──────────────────────────────────────────────────────────────────────
@@ -411,7 +540,14 @@ func _on_stop() -> void:
 func _on_loop() -> void:
 	looping = not looping
 	loop_btn.modulate.a = 1.0 if looping else 0.4
-	_play_current()
+	if spine_node == null: return
+	var state = spine_node.get_animation_state()
+	if state == null: return
+	var entry = state.get_current(0)
+	if entry != null:
+		entry.set_loop(looping)
+	else:
+		_play_current()
 
 func _on_speed(value: float) -> void:
 	speed_lbl.text = "%.1f×" % value
